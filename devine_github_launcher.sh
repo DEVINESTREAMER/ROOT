@@ -8,9 +8,6 @@ PATH=/system/bin:/system/xbin:/vendor/bin:/data/data/com.termux/files/usr/bin:$P
 export PATH
 [ "$(id -u)" = 0 ] || { echo 'Root required'; exit 1; }
 mkdir -p "$DIR" || exit 1
-if [ -x /data/data/com.termux/files/usr/bin/curl ]; then
-  /data/data/com.termux/files/usr/bin/curl -fLsS --connect-timeout 3 --max-time 8 "$BASE/devine_check_diagnostics.sh" -o "$DIR/devine_check_diagnostics.sh" 2>/dev/null || :
-fi
 chmod 700 "$DIR"
 # Bundled auto-fix is stored locally and invoked as a separate shell script.
 cat > "$DIR/devine_auto_fix.sh" <<'DEVINE_AUTOFIX'
@@ -72,28 +69,18 @@ spin(){
 }
 open_page(){ /system/bin/am start --user 0 -a android.intent.action.VIEW -d "$1" >/dev/null 2>&1 || printf 'Open manually: %s\n' "$1"; }
 get_url(){ sed 's/\033\[[0-9;]*[[:alpha:]]//g' "$LOG" 2>/dev/null | grep -Eo 'https?://([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}(/[^[:space:]]*)?|https?://localhost:[0-9]{2,5}(/[^[:space:]]*)?' | head -n 1; }
-# Identify the process that owns a LISTEN socket on TCP 8080.
-# Never kill a process based on its name alone or on port occupancy alone.
-port_owner(){
-  inodes=$(awk 'NR>1 && $2 ~ /:1F90$/ && $4=="0A" {print $10}' /proc/net/tcp /proc/net/tcp6 2>/dev/null)
-  [ -n "$inodes" ] || return 1
-  for d in /proc/[0-9]*; do
-    pid=${d##*/}
-    for fd in "$d"/fd/*; do
-      link=$(readlink "$fd" 2>/dev/null) || continue
-      case "$link" in socket:*) :;; *) continue;; esac
-      for inode in $inodes; do
-        [ "$link" = "socket:[$inode]" ] || continue
-        cmd=$(tr '\000' ' ' < "$d/cmdline" 2>/dev/null)
-        exe=$(readlink "$d/exe" 2>/dev/null)
-        case "$cmd $exe" in
-          *Devine2.5.sh*|*/data/local/tmp/devine/Devine2.5.sh*) printf '%s\n' "$pid"; return 0;;
-        esac
-      done
-    done
-  done
-  return 1
+# Reuse the local listener without stopping it or trusting a stale log URL.
+reuse_running(){
+  printf "${G}  Already running on port 8080.${N}\n"
+  printf '  URL: http://127.0.0.1:8080\n'
+  open_page 'http://127.0.0.1:8080'
+  exit 0
 }
+# Check before compatibility cleanup, driver prompts or downloads.
+if port_up; then reuse_running; fi
+if [ -x /data/data/com.termux/files/usr/bin/curl ]; then
+  /data/data/com.termux/files/usr/bin/curl -fLsS --connect-timeout 3 --max-time 8 "$BASE/devine_check_diagnostics.sh" -o "$DIR/devine_check_diagnostics.sh" 2>/dev/null || :
+fi
 
 # Optional driver installer. Provide a local file path only when driver is missing.
 DRIVER_INPUT=${1:-${DRIVER_PATH:-}}
@@ -173,29 +160,8 @@ else
 fi
 
 printf "${P}◆ STEP 01${N}  Port 8080 status\n"
-if port_up; then
-  OLD_PID=$(port_owner)
-  if [ -z "$OLD_PID" ]; then
-    printf "${Y}  ! Port 8080 is owned by another/unknown service.\n"
-    printf '  Refusing to terminate an unidentified process.\n'
-    exit 2
-  fi
-  printf "${C}  ↻ Restarting existing Devine (PID %s)${N}\n" "$OLD_PID"
-  kill -TERM "$OLD_PID" 2>/dev/null || { echo 'Unable to stop old Devine'; exit 2; }
-  i=0
-  while port_up && [ "$i" -lt 6 ]; do
-    printf "\r${C}  ◌ Waiting for Devine shutdown: %ss${N} " "$i"
-    sleep 1; i=$((i+1))
-  done
-  printf '\n'
-  if port_up; then
-    printf "${Y}  ! Old Devine still holds port 8080; not force-killing it.${N}\n"
-    exit 2
-  fi
-  printf "${G}  ✔ Old Devine stopped; starting fresh.${N}\n\n"
-else
-  printf "${G}  ✔ Port available; starting Devine.${N}\n\n"
-fi
+if port_up; then reuse_running; fi
+printf "${G}  Port available; starting Devine.${N}\n\n"
 printf "${P}◆ STEP 02${N}  Secure download\n"
 fetch >"$DIR/download.log" 2>&1 & DL=$!
 if ! spin "$DL" 'Fetching Devine from GitHub'; then
@@ -204,7 +170,7 @@ fi
 magic=$(od -An -tx1 -N4 "$BIN" 2>/dev/null | tr -d ' \n')
 [ "$magic" = 7f454c46 ] || { echo 'Invalid ELF download'; exit 1; }
 chmod 700 "$BIN"
-if port_up; then printf "${Y}  ! Port 8080 became occupied during download; not replacing its owner.${N}\n"; exit 2; fi
+if port_up; then reuse_running; fi
 printf "\n${P}◆ STEP 03${N}  Launch sequence\n"
 cd "$DIR" || exit 1
 : > "$LOG"
